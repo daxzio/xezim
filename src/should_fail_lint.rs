@@ -1772,12 +1772,20 @@ fn check_wildcard_cmp(items: &[ModuleItem], _elab: &ElaboratedModule, errs: &mut
 /// find 'a' in hierarchical name"), as does ivtest pr1988302b.
 ///
 /// Conservative: a label is only checked when it names nothing BUT statement
-/// blocks design-wide (no instance, generate block, subroutine, variable or
-/// net shares it), and a block's members are over-approximated as every
-/// variable and nested block label anywhere in its body.
+/// blocks design-wide (no instance, generate block, subroutine, variable,
+/// net or port shares it), and a block's members are over-approximated as
+/// every variable and nested block label anywhere in its body.
+///
+/// A dotted name that has already passed through a variable, net or port is
+/// a member select (§7.2.2), not a descent into a named block. Otherwise
+/// `resp.exception.valid` is rejected because some other module contains
+/// `begin : exception`.
 fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut blocks: HashMap<String, HashSet<String>> = HashMap::new();
     let mut other: HashSet<String> = HashSet::new();
+    // Names of values. A later dotted segment is a member select, not a
+    // named-block scope.
+    let mut values: HashSet<String> = HashSet::new();
 
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
@@ -1793,9 +1801,23 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
             });
         }
     }
-    fn note_stmt(st: &Statement, blocks: &mut HashMap<String, HashSet<String>>) {
-        for_each_stmt(st, &mut |s| {
-            if let StatementKind::SeqBlock {
+    fn note_value(name: String, values: &mut HashSet<String>, other: &mut HashSet<String>) {
+        values.insert(name.clone());
+        other.insert(name);
+    }
+    fn note_stmt(
+        st: &Statement,
+        blocks: &mut HashMap<String, HashSet<String>>,
+        values: &mut HashSet<String>,
+        other: &mut HashSet<String>,
+    ) {
+        for_each_stmt(st, &mut |s| match &s.kind {
+            StatementKind::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    note_value(d.name.name.clone(), values, other);
+                }
+            }
+            StatementKind::SeqBlock {
                 name: Some(n),
                 stmts,
             }
@@ -1803,17 +1825,38 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                 name: Some(n),
                 stmts,
                 ..
-            } = &s.kind
-            {
+            } => {
                 block_members(stmts, blocks.entry(n.name.clone()).or_default());
             }
+            _ => {}
         });
+    }
+    fn note_ports(
+        ports: &xezim_core::ast::module::PortList,
+        values: &mut HashSet<String>,
+        other: &mut HashSet<String>,
+    ) {
+        use xezim_core::ast::module::PortList;
+        match ports {
+            PortList::Ansi(ps) => {
+                for p in ps {
+                    note_value(p.name.name.clone(), values, other);
+                }
+            }
+            PortList::NonAnsi(ns) => {
+                for n in ns {
+                    note_value(n.name.clone(), values, other);
+                }
+            }
+            PortList::Empty => {}
+        }
     }
     fn walk_items<'a>(
         items: &'a [ModuleItem],
         stmts: &mut Vec<&'a Statement>,
         exprs: &mut Vec<&'a Expression>,
         other: &mut HashSet<String>,
+        values: &mut HashSet<String>,
     ) {
         for it in items {
             match it {
@@ -1838,26 +1881,35 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                     other.extend(mi.instances.iter().map(|h| h.name.name.clone()));
                 }
                 ModuleItem::DataDeclaration(d) => {
-                    other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    for x in &d.declarators {
+                        note_value(x.name.name.clone(), values, other);
+                    }
                 }
                 ModuleItem::NetDeclaration(d) => {
-                    other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    for x in &d.declarators {
+                        note_value(x.name.name.clone(), values, other);
+                    }
                 }
-                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other),
+                ModuleItem::PortDeclaration(d) => {
+                    for x in &d.declarators {
+                        note_value(x.name.name.clone(), values, other);
+                    }
+                }
+                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other, values),
                 ModuleItem::GenerateIf(g) => {
                     other.extend(g.branch_labels.iter().flatten().cloned());
                     for (_, b) in &g.branches {
-                        walk_items(b, stmts, exprs, other);
+                        walk_items(b, stmts, exprs, other, values);
                     }
                 }
                 ModuleItem::GenerateFor(g) => {
                     other.extend(g.name.iter().cloned());
-                    walk_items(&g.items, stmts, exprs, other);
+                    walk_items(&g.items, stmts, exprs, other, values);
                 }
                 ModuleItem::GenerateCase(g) => {
                     for arm in &g.arms {
                         other.extend(arm.label.iter().cloned());
-                        walk_items(&arm.items, stmts, exprs, other);
+                        walk_items(&arm.items, stmts, exprs, other, values);
                     }
                 }
                 _ => {}
@@ -1867,16 +1919,19 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut stmts: Vec<&Statement> = Vec::new();
     let mut exprs: Vec<&Expression> = Vec::new();
     for def in defs {
-        let items = match def {
-            SourceDefinition::Module(m) => &m.items,
-            SourceDefinition::Interface(m) => &m.items,
-            SourceDefinition::Program(m) => &m.items,
+        let (items, ports) = match def {
+            SourceDefinition::Module(m) => (&m.items, Some(&m.ports)),
+            SourceDefinition::Interface(m) => (&m.items, Some(&m.ports)),
+            SourceDefinition::Program(m) => (&m.items, Some(&m.ports)),
             _ => continue,
         };
-        walk_items(items, &mut stmts, &mut exprs, &mut other);
+        if let Some(ports) = ports {
+            note_ports(ports, &mut values, &mut other);
+        }
+        walk_items(items, &mut stmts, &mut exprs, &mut other, &mut values);
     }
     for st in &stmts {
-        note_stmt(st, &mut blocks);
+        note_stmt(st, &mut blocks, &mut values, &mut other);
     }
     blocks.retain(|label, _| !other.contains(label));
     if blocks.is_empty() {
@@ -1908,10 +1963,15 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
         if !segments(e, &mut segs) {
             return;
         }
-        for w in segs.windows(2) {
+        for (i, w) in segs.windows(2).enumerate() {
             let Some(members) = blocks.get(&w[0]) else {
                 continue;
             };
+            // `resp.exception.valid`: `exception` is a member of the value
+            // `resp`, even when another scope has `begin : exception`.
+            if segs[..i].iter().any(|seg| values.contains(seg)) {
+                continue;
+            }
             if !members.contains(&w[1]) {
                 let msg = format!(
                     "'{}' is not declared in block '{}' (hierarchical name '{}', IEEE \
